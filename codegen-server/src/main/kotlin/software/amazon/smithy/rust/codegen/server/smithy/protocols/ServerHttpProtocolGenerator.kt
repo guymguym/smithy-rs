@@ -704,9 +704,10 @@ private class ServerHttpProtocolImplGenerator(
         }
 
         with(writer) {
+            // S3D FIX https://github.com/awslabs/smithy-rs/issues/1011
             rustTemplate(
                 """
-                let query_string = request.uri().query().ok_or(#{SmithyHttpServer}::rejection::MissingQueryString)?;
+                let query_string = request.uri().query().unwrap_or("");
                 let pairs = #{SerdeUrlEncoded}::from_str::<Vec<(&str, &str)>>(query_string)?;
                 """.trimIndent(),
                 *codegenScope

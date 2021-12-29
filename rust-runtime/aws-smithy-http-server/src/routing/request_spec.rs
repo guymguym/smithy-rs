@@ -39,6 +39,15 @@ pub struct QuerySpec(Vec<QuerySegment>);
 
 impl QuerySpec {
     pub fn from_vector_unchecked(query_segments: Vec<QuerySegment>) -> Self {
+        // S3D FIX https://github.com/awslabs/smithy-rs/issues/1012
+        let query_segments: Vec<QuerySegment> = query_segments
+            .iter()
+            .filter(|segment| match segment {
+                QuerySegment::Key(_) => true,
+                QuerySegment::KeyValue(key, _) => key != "x-id",
+            })
+            .cloned()
+            .collect();
         QuerySpec(query_segments)
     }
 }
@@ -114,7 +123,9 @@ impl From<&PathSpec> for Regex {
                 .fold(String::new(), |a, b| a + sep + b)
         };
 
-        Regex::new(&format!("{}$", re)).unwrap()
+        // S3D FIX https://github.com/awslabs/smithy-rs/issues/1009
+        let re = if re.is_empty() { String::from(sep) } else { re };
+        Regex::new(&format!("^{}$", re)).unwrap()
     }
 }
 
