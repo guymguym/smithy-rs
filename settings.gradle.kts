@@ -24,3 +24,6 @@ include(":aws:sdk-codegen")
 include(":aws:sdk-codegen-test")
 include(":aws:sdk")
 include(":aws:rust-runtime")
+
+include(":codegen-s3d")
+project(":codegen-s3d").projectDir = file("../codegen")
