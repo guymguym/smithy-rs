@@ -1,0 +1,18 @@
+{
+    "version": "1.0",
+    "projections": {
+        "s3": {
+            "imports": ["../aws/sdk/aws-models/s3.json"],
+            "plugins": {
+                "rust-server-codegen": {
+                    "module": "s3d-smithy-codegen-server-s3",
+                    "moduleDescription": "s3d-smithy-codegen-server-s3",
+                    "moduleAuthors": ["s3d@s3d.rs"],
+                    "moduleVersion": "0.0.1",
+                    "service": "com.amazonaws.s3#AmazonS3",
+                    "runtimeConfig": { "relativePath": "../" }
+                }
+            }
+        }
+    }
+}
