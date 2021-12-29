@@ -196,7 +196,7 @@ class XmlBindingTraitSerializerGenerator(
         val outputShape = operationShape.outputShape(model)
         val xmlMembers = operationShape.operationXmlMembers()
         val operationXmlName = xmlIndex.operationOutputShapeName(operationShape)
-            ?: throw CodegenException("operation must have a name if it has members")
+            ?: outputShape.id.name
         return RuntimeType.forInlineFun(fnName, operationSerModule) {
             it.rustBlockTemplate(
                 "pub fn $fnName(output: &#{target}) -> Result<String, #{Error}>",
