@@ -1,0 +1,2 @@
+# S3D BUILD - generate all ops with InternalServerError
+software.amazon.smithy.rust.codegen.server.smithy.customizations.AddInternalServerErrorToAllOperationsDecorator

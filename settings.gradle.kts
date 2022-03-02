@@ -32,3 +32,5 @@ buildscript {
         google()
     }
 }
+
+include(":s3d")
