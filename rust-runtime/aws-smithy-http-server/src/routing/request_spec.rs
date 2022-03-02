@@ -41,6 +41,15 @@ pub struct QuerySpec(Vec<QuerySegment>);
 
 impl QuerySpec {
     pub fn from_vector_unchecked(query_segments: Vec<QuerySegment>) -> Self {
+        // S3D ROUTING HACK x-id - https://github.com/awslabs/smithy-rs/issues/1012
+        // let query_segments: Vec<QuerySegment> = query_segments
+        //     .iter()
+        //     .filter(|segment| match segment {
+        //         QuerySegment::Key(_) => true,
+        //         QuerySegment::KeyValue(key, _) => key != "x-id",
+        //     })
+        //     .cloned()
+        //     .collect();
         QuerySpec(query_segments)
     }
 }
@@ -109,7 +118,9 @@ impl From<&PathSpec> for Regex {
                     PathSegment::Literal(literal) => Cow::Owned(regex::escape(literal)),
                     // TODO(https://github.com/awslabs/smithy/issues/975) URL spec says it should be ASCII but this regex accepts UTF-8:
                     // `*` instead of `+` because the empty string `""` can be bound to a label.
-                    PathSegment::Label => Cow::Borrowed("[^/]*"),
+                    // S3D ROUTING HACK - trying `+` instead of `*` to avoid empty strings for S3 bucket and key labels
+                    PathSegment::Label => Cow::Borrowed("[^/]+"),
+                    // PathSegment::Label => Cow::Borrowed("[^/]*"),
                     PathSegment::Greedy => Cow::Borrowed(".*"),
                 })
                 .fold(String::new(), |a, b| a + sep + &b)
@@ -159,7 +170,12 @@ impl RequestSpec {
     ///
     /// [the TypeScript sSDK is implementing]: https://github.com/awslabs/smithy-typescript/blob/d263078b81485a6a2013d243639c0c680343ff47/smithy-typescript-ssdk-libs/server-common/src/httpbinding/mux.ts#L59.
     pub(crate) fn rank(&self) -> usize {
-        self.uri_spec.path_and_query.path_segments.0.len() + self.uri_spec.path_and_query.query_segments.0.len()
+        // self.uri_spec.path_and_query.path_segments.0.len() + self.uri_spec.path_and_query.query_segments.0.len()
+        // S3D ROUTING HACK - more weight to routes with more labels so that S3 `bucket` paths will not shadow `bucket/key` paths
+        let paths_weight = 1000;
+        let query_weight = 1;
+        (paths_weight * self.uri_spec.path_and_query.path_segments.0.len())
+            + (query_weight * self.uri_spec.path_and_query.query_segments.0.len())
     }
 
     pub(crate) fn matches<B>(&self, req: &Request<B>) -> Match {
