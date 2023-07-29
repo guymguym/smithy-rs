@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_http::user_agent::AwsUserAgent;
-use aws_sdk_s3control::{Client, Credentials, Region};
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3control::config::{Credentials, Region};
+use aws_sdk_s3control::Client;
 use aws_smithy_client::test_connection::TestConnection;
 use aws_smithy_http::body::SdkBody;
-use aws_types::credentials::SharedCredentialsProvider;
 use aws_types::SdkConfig;
-use std::convert::Infallible;
 use std::time::{Duration, UNIX_EPOCH};
 
 #[tokio::test]
@@ -26,13 +25,7 @@ async fn test_signer() {
         http::Response::builder().status(200).body("").unwrap(),
     )]);
     let sdk_config = SdkConfig::builder()
-        .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-            "ANOTREAL",
-            "notrealrnrELgWzOk3IfjzDKtFBhDby",
-            Some("notarealsessiontoken".to_string()),
-            None,
-            "test",
-        )))
+        .credentials_provider(SharedCredentialsProvider::new(Credentials::for_tests()))
         .http_connector(conn.clone())
         .region(Region::new("us-east-1"))
         .build();
@@ -44,14 +37,9 @@ async fn test_signer() {
         .customize()
         .await
         .unwrap()
-        .map_operation(|mut op| {
-            op.properties_mut()
-                .insert(UNIX_EPOCH + Duration::from_secs(1636751225));
-            op.properties_mut().insert(AwsUserAgent::for_tests());
-
-            Result::Ok::<_, Infallible>(op)
-        })
-        .unwrap()
+        .request_time_for_tests(UNIX_EPOCH + Duration::from_secs(1636751225))
+        .user_agent_for_tests()
+        .remove_invocation_id_for_tests()
         .send()
         .await
         .expect_err("empty response");

@@ -18,19 +18,10 @@
 //! [`Client`](crate::Client), directly, use the `dyn_https_https()` method to match that default behavior:
 //!
 #![cfg_attr(
-    not(all(
-        any(feature = "rustls", feature = "native-tls"),
-        feature = "client-hyper"
-    )),
+    not(all(feature = "rustls", feature = "client-hyper")),
     doc = "```no_run,ignore"
 )]
-#![cfg_attr(
-    all(
-        any(feature = "rustls", feature = "native-tls"),
-        feature = "client-hyper"
-    ),
-    doc = "```no_run"
-)]
+#![cfg_attr(all(feature = "rustls", feature = "client-hyper"), doc = "```no_run")]
 //! use aws_smithy_client::Client;
 //!
 //! let client = Client::builder()
@@ -51,7 +42,14 @@
     not(all(feature = "rustls", feature = "client-hyper")),
     doc = "```no_run,ignore"
 )]
-#![cfg_attr(all(feature = "rustls", feature = "client-hyper"), doc = "```no_run")]
+#![cfg_attr(
+    all(
+        feature = "rustls",
+        feature = "client-hyper",
+        feature = "hyper-webpki-doctest-only"
+    ),
+    doc = "```no_run"
+)]
 //! use std::time::Duration;
 //! use aws_smithy_client::{Client, conns, hyper_ext};
 //! use aws_smithy_client::erase::DynConnector;
@@ -83,15 +81,22 @@ use crate::http_connector::ConnectorSettings;
 use crate::hyper_ext::timeout_middleware::{ConnectTimeout, HttpReadTimeout, HttpTimeoutError};
 use crate::never::stream::EmptyStream;
 use aws_smithy_async::future::timeout::TimedOutError;
-use aws_smithy_async::rt::sleep::{default_async_sleep, AsyncSleep};
+use aws_smithy_async::rt::sleep::{default_async_sleep, SharedAsyncSleep};
 use aws_smithy_http::body::SdkBody;
+
 use aws_smithy_http::result::ConnectorError;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::retry::ErrorKind;
-use http::Uri;
-use hyper::client::connect::{Connected, Connection};
+use http::{Extensions, Uri};
+use hyper::client::connect::{
+    capture_connection, CaptureConnection, Connected, Connection, HttpInfo,
+};
+
 use std::error::Error;
-use std::sync::Arc;
+use std::fmt::Debug;
+
+use crate::erase::boxclone::BoxFuture;
+use aws_smithy_http::connection::{CaptureSmithyConnection, ConnectionMetadata};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{BoxError, Service};
 
@@ -100,13 +105,35 @@ use tower::{BoxError, Service};
 /// This adapter also enables TCP `CONNECT` and HTTP `READ` timeouts via [`Adapter::builder`]. For examples
 /// see [the module documentation](crate::hyper_ext).
 #[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct Adapter<C>(HttpReadTimeout<hyper::Client<ConnectTimeout<C>, SdkBody>>);
+pub struct Adapter<C> {
+    client: HttpReadTimeout<hyper::Client<ConnectTimeout<C>, SdkBody>>,
+}
+
+/// Extract a smithy connection from a hyper CaptureConnection
+fn extract_smithy_connection(capture_conn: &CaptureConnection) -> Option<ConnectionMetadata> {
+    let capture_conn = capture_conn.clone();
+    if let Some(conn) = capture_conn.clone().connection_metadata().as_ref() {
+        let mut extensions = Extensions::new();
+        conn.get_extras(&mut extensions);
+        let http_info = extensions.get::<HttpInfo>();
+        let smithy_connection = ConnectionMetadata::new(
+            conn.is_proxied(),
+            http_info.map(|info| info.remote_addr()),
+            move || match capture_conn.connection_metadata().as_ref() {
+                Some(conn) => conn.poison(),
+                None => tracing::trace!("no connection existed to poison"),
+            },
+        );
+        Some(smithy_connection)
+    } else {
+        None
+    }
+}
 
 impl<C> Service<http::Request<SdkBody>> for Adapter<C>
 where
     C: Clone + Send + Sync + 'static,
-    C: tower::Service<Uri>,
+    C: Service<Uri>,
     C::Response: Connection + AsyncRead + AsyncWrite + Send + Unpin + 'static,
     C::Future: Unpin + Send + 'static,
     C::Error: Into<BoxError>,
@@ -114,20 +141,22 @@ where
     type Response = http::Response<SdkBody>;
     type Error = ConnectorError;
 
-    #[allow(clippy::type_complexity)]
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
-    >;
+    type Future = BoxFuture<Self::Response, Self::Error>;
 
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.0.poll_ready(cx).map_err(downcast_error)
+        self.client.poll_ready(cx).map_err(downcast_error)
     }
 
-    fn call(&mut self, req: http::Request<SdkBody>) -> Self::Future {
-        let fut = self.0.call(req);
+    fn call(&mut self, mut req: http::Request<SdkBody>) -> Self::Future {
+        let capture_connection = capture_connection(&mut req);
+        if let Some(capture_smithy_connection) = req.extensions().get::<CaptureSmithyConnection>() {
+            capture_smithy_connection
+                .set_connection_retriever(move || extract_smithy_connection(&capture_connection));
+        }
+        let fut = self.client.call(req);
         Box::pin(async move { Ok(fut.await.map_err(downcast_error)?.map(SdkBody::from)) })
     }
 }
@@ -196,9 +225,9 @@ fn find_source<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option
 
 /// Builder for [`hyper_ext::Adapter`](Adapter)
 ///
-/// Unlike a Smithy client, the [`tower::Service`] inside a [`hyper_ext::Adapter`](Adapter) is actually a service that
-/// accepts a `Uri` and returns a TCP stream. Two default implementations of this are provided, one
-/// that encrypts the stream with `rustls`, the other that encrypts the stream with `native-tls`.
+/// Unlike a Smithy client, the [`Service`] inside a [`hyper_ext::Adapter`](Adapter) is actually a service that
+/// accepts a `Uri` and returns a TCP stream. One default implementation of this is provided,
+/// that encrypts the stream with `rustls`.
 ///
 /// # Examples
 /// Construct a HyperAdapter with the default HTTP implementation (rustls). This can be useful when you want to share a Hyper connector
@@ -221,7 +250,7 @@ fn find_source<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option
 #[derive(Default, Debug)]
 pub struct Builder {
     connector_settings: Option<ConnectorSettings>,
-    sleep_impl: Option<Arc<dyn AsyncSleep>>,
+    sleep_impl: Option<SharedAsyncSleep>,
     client_builder: Option<hyper::client::Builder>,
 }
 
@@ -230,7 +259,7 @@ impl Builder {
     pub fn build<C>(self, connector: C) -> Adapter<C>
     where
         C: Clone + Send + Sync + 'static,
-        C: tower::Service<Uri>,
+        C: Service<Uri>,
         C::Response: Connection + AsyncRead + AsyncWrite + Send + Unpin + 'static,
         C::Future: Unpin + Send + 'static,
         C::Error: Into<BoxError>,
@@ -257,21 +286,21 @@ impl Builder {
         let read_timeout = match read_timeout {
             Some(duration) => HttpReadTimeout::new(
                 base,
-                sleep_impl
-                    .clone()
-                    .expect("a sleep impl must be provided in order to have a read timeout"),
+                sleep_impl.expect("a sleep impl must be provided in order to have a read timeout"),
                 duration,
             ),
             None => HttpReadTimeout::no_timeout(base),
         };
-        Adapter(read_timeout)
+        Adapter {
+            client: read_timeout,
+        }
     }
 
     /// Set the async sleep implementation used for timeouts
     ///
     /// Calling this is only necessary for testing or to use something other than
-    /// [`aws_smithy_async::rt::sleep::default_async_sleep`].
-    pub fn sleep_impl(mut self, sleep_impl: Arc<dyn AsyncSleep + 'static>) -> Self {
+    /// [`default_async_sleep`].
+    pub fn sleep_impl(mut self, sleep_impl: SharedAsyncSleep) -> Self {
         self.sleep_impl = Some(sleep_impl);
         self
     }
@@ -279,11 +308,8 @@ impl Builder {
     /// Set the async sleep implementation used for timeouts
     ///
     /// Calling this is only necessary for testing or to use something other than
-    /// [`aws_smithy_async::rt::sleep::default_async_sleep`].
-    pub fn set_sleep_impl(
-        &mut self,
-        sleep_impl: Option<Arc<dyn AsyncSleep + 'static>>,
-    ) -> &mut Self {
+    /// [`default_async_sleep`].
+    pub fn set_sleep_impl(&mut self, sleep_impl: Option<SharedAsyncSleep>) -> &mut Self {
         self.sleep_impl = sleep_impl;
         self
     }
@@ -328,7 +354,6 @@ mod timeout_middleware {
     use std::fmt::Formatter;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -336,10 +361,9 @@ mod timeout_middleware {
     use pin_project_lite::pin_project;
     use tower::BoxError;
 
-    use aws_smithy_async::future;
     use aws_smithy_async::future::timeout::{TimedOutError, Timeout};
-    use aws_smithy_async::rt::sleep::AsyncSleep;
     use aws_smithy_async::rt::sleep::Sleep;
+    use aws_smithy_async::rt::sleep::{AsyncSleep, SharedAsyncSleep};
 
     #[derive(Debug)]
     pub(crate) struct HttpTimeoutError {
@@ -373,21 +397,21 @@ mod timeout_middleware {
     #[derive(Clone, Debug)]
     pub(super) struct ConnectTimeout<I> {
         inner: I,
-        timeout: Option<(Arc<dyn AsyncSleep>, Duration)>,
+        timeout: Option<(SharedAsyncSleep, Duration)>,
     }
 
     impl<I> ConnectTimeout<I> {
         /// Create a new `ConnectTimeout` around `inner`.
         ///
         /// Typically, `I` will implement [`hyper::client::connect::Connect`].
-        pub fn new(inner: I, sleep: Arc<dyn AsyncSleep>, timeout: Duration) -> Self {
+        pub(crate) fn new(inner: I, sleep: SharedAsyncSleep, timeout: Duration) -> Self {
             Self {
                 inner,
                 timeout: Some((sleep, timeout)),
             }
         }
 
-        pub fn no_timeout(inner: I) -> Self {
+        pub(crate) fn no_timeout(inner: I) -> Self {
             Self {
                 inner,
                 timeout: None,
@@ -396,23 +420,23 @@ mod timeout_middleware {
     }
 
     #[derive(Clone, Debug)]
-    pub struct HttpReadTimeout<I> {
+    pub(crate) struct HttpReadTimeout<I> {
         inner: I,
-        timeout: Option<(Arc<dyn AsyncSleep>, Duration)>,
+        timeout: Option<(SharedAsyncSleep, Duration)>,
     }
 
     impl<I> HttpReadTimeout<I> {
         /// Create a new `HttpReadTimeout` around `inner`.
         ///
         /// Typically, `I` will implement [`tower::Service<http::Request<SdkBody>>`].
-        pub fn new(inner: I, sleep: Arc<dyn AsyncSleep>, timeout: Duration) -> Self {
+        pub(crate) fn new(inner: I, sleep: SharedAsyncSleep, timeout: Duration) -> Self {
             Self {
                 inner,
                 timeout: Some((sleep, timeout)),
             }
         }
 
-        pub fn no_timeout(inner: I) -> Self {
+        pub(crate) fn no_timeout(inner: I) -> Self {
             Self {
                 inner,
                 timeout: None,
@@ -486,7 +510,7 @@ mod timeout_middleware {
                 Some((sleep, duration)) => {
                     let sleep = sleep.sleep(*duration);
                     MaybeTimeoutFuture::Timeout {
-                        timeout: future::timeout::Timeout::new(self.inner.call(req), sleep),
+                        timeout: Timeout::new(self.inner.call(req), sleep),
                         error_type: "HTTP connect",
                         duration: *duration,
                     }
@@ -515,7 +539,7 @@ mod timeout_middleware {
                 Some((sleep, duration)) => {
                     let sleep = sleep.sleep(*duration);
                     MaybeTimeoutFuture::Timeout {
-                        timeout: future::timeout::Timeout::new(self.inner.call(req), sleep),
+                        timeout: Timeout::new(self.inner.call(req), sleep),
                         error_type: "HTTP read",
                         duration: *duration,
                     }
@@ -533,11 +557,10 @@ mod timeout_middleware {
         use crate::hyper_ext::Adapter;
         use crate::never::{NeverConnected, NeverReplies};
         use aws_smithy_async::assert_elapsed;
-        use aws_smithy_async::rt::sleep::TokioSleep;
+        use aws_smithy_async::rt::sleep::{SharedAsyncSleep, TokioSleep};
         use aws_smithy_http::body::SdkBody;
         use aws_smithy_types::error::display::DisplayErrorContext;
         use aws_smithy_types::timeout::TimeoutConfig;
-        use std::sync::Arc;
         use std::time::Duration;
         use tower::Service;
 
@@ -559,7 +582,7 @@ mod timeout_middleware {
             );
             let mut hyper = Adapter::builder()
                 .connector_settings(connector_settings)
-                .sleep_impl(Arc::new(TokioSleep::new()))
+                .sleep_impl(SharedAsyncSleep::new(TokioSleep::new()))
                 .build(inner);
             let now = tokio::time::Instant::now();
             tokio::time::pause();
@@ -598,7 +621,7 @@ mod timeout_middleware {
             );
             let mut hyper = Adapter::builder()
                 .connector_settings(connector_settings)
-                .sleep_impl(Arc::new(TokioSleep::new()))
+                .sleep_impl(SharedAsyncSleep::new(TokioSleep::new()))
                 .build(inner);
             let now = tokio::time::Instant::now();
             tokio::time::pause();
@@ -681,7 +704,7 @@ mod test {
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Err(std::io::Error::new(
+            Poll::Ready(Err(Error::new(
                 ErrorKind::ConnectionReset,
                 "connection reset",
             )))
@@ -713,7 +736,7 @@ mod test {
 
     impl<T> tower::Service<Uri> for TestConnection<T>
     where
-        T: Clone + hyper::client::connect::Connection,
+        T: Clone + Connection,
     {
         type Response = T;
         type Error = BoxError;

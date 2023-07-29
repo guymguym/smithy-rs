@@ -14,6 +14,43 @@ import software.amazon.smithy.model.traits.TitleTrait
 import java.io.File
 import kotlin.streams.toList
 
+data class RootTest(
+    val path: File,
+    val manifestName: String,
+)
+
+// TODO(https://github.com/awslabs/smithy-rs/issues/2810): We can remove the `Flat` layout after the switch
+// to `Workspaces` has been released. This can be checked by looking at the `examples/` directory in aws-sdk-rust's
+// main branch.
+//
+// The `Flat` layout is retained for backwards compatibility so that the next release process can succeed.
+enum class AwsExamplesLayout {
+    /**
+     * Directory layout for examples used prior to June 26, 2023,
+     * where each example was in the `rust_dev_preview/` root directory and
+     * was considered to be its own workspace.
+     *
+     * This layout had issues with CI in terms of time to compile and disk space required
+     * since the dependencies would get recompiled for every example.
+     */
+    Flat,
+
+    /**
+     * Current directory layout where there are a small number of workspaces
+     * rooted in `rust_dev_preview/`.
+     */
+    Workspaces,
+    ;
+
+    companion object {
+        fun detect(project: Project): AwsExamplesLayout = if (project.projectDir.resolve("examples/Cargo.toml").exists()) {
+            AwsExamplesLayout.Flat
+        } else {
+            AwsExamplesLayout.Workspaces
+        }
+    }
+}
+
 class AwsServices(
     private val project: Project,
     services: List<AwsService>,
@@ -23,37 +60,72 @@ class AwsServices(
     val services: List<AwsService>
     val moduleNames: Set<String> by lazy { services.map { it.module }.toSortedSet() }
 
+    init {
+        this.services = services.sortedBy { it.module }
+    }
+
     val allModules: Set<String> by lazy {
         (
             services.map(AwsService::module).map { "sdk/$it" } +
                 CrateSet.AWS_SDK_SMITHY_RUNTIME.map { "sdk/$it" } +
-                CrateSet.AWS_SDK_RUNTIME.map { "sdk/$it" } +
-                examples
+                CrateSet.AWS_SDK_RUNTIME.map { "sdk/$it" }
+            // Root tests should not be included since they can't be part of the root Cargo workspace
+            // in order to test differences in Cargo features. Examples should not be included either
+            // because each example itself is a workspace.
             ).toSortedSet()
     }
 
     val examples: List<String> by lazy {
-        project.projectDir.resolve("examples")
-            .listFiles { file -> !file.name.startsWith(".") }.orEmpty().toList()
-            .filter { file ->
-                val cargoToml = File(file, "Cargo.toml")
-                if (cargoToml.exists()) {
-                    val usedModules = cargoToml.readLines()
-                        .map { line -> line.substringBefore('=').trim() }
-                        .filter { line -> line.startsWith("aws-sdk-") }
-                        .map { line -> line.substringAfter("aws-sdk-") }
-                        .toSet()
-                    moduleNames.containsAll(usedModules)
-                } else {
-                    false
-                }
-            }
-            .map { "examples/${it.name}" }
+        val examplesRoot = project.projectDir.resolve("examples")
+        if (AwsExamplesLayout.detect(project) == AwsExamplesLayout.Flat) {
+            examplesRoot.listFiles { file -> !file.name.startsWith(".") }.orEmpty().toList()
+                .filter { file -> manifestCompatibleWithGeneratedServices(file) }
+                .map { "examples/${it.name}" }
+        } else {
+            examplesRoot.listFiles { file ->
+                !file.name.startsWith(".") && file.isDirectory() && file.resolve("Cargo.toml").exists()
+            }.orEmpty().toList().map { "examples/${it.name}" }
+        }
     }
 
-    init {
-        this.services = services.sortedBy { it.module }
+    /**
+     * Tests in `aws/sdk/integration-tests` that are not named after a service module, and therefore,
+     * are not included in a service's `tests/` directory. These are to be included at the SDK root
+     * `tests/` directory for inclusion in CI.
+     */
+    val rootTests: List<RootTest> by lazy {
+        project.projectDir.resolve("integration-tests")
+            .listFiles { file -> !file.name.startsWith(".") }.orEmpty().toList()
+            .filter { file -> !moduleNames.contains(file.name) && manifestCompatibleWithGeneratedServices(file) }
+            .map { file -> RootTest(file, "tests/${file.name}") }
     }
+
+    /**
+     * Returns true if the Cargo manifest in the given path is compatible with the set of generated services.
+     */
+    private fun manifestCompatibleWithGeneratedServices(path: File) =
+        File(path, "Cargo.toml").let { cargoToml ->
+            if (cargoToml.exists()) {
+                val usedModules = cargoToml.readLines()
+                    .map { line -> line.substringBefore('=').trim() }
+                    .filter { line -> line.startsWith("aws-sdk-") }
+                    .map { line -> line.substringAfter("aws-sdk-") }
+                    .toSet()
+                moduleNames.containsAll(usedModules)
+            } else {
+                false
+            }
+        }
+
+    /**
+     * Returns a sorted set of members included in the workspace.
+     */
+    fun includedInWorkspace() = allModules
+
+    /**
+     * Returns a list of crates excluded from the workspace.
+     */
+    fun excludedFromWorkspace() = examples + rootTests.map(RootTest::manifestName)
 }
 
 /**
@@ -111,9 +183,9 @@ fun Project.discoverServices(awsModelsPath: String?, serviceMembership: Membersh
         serviceMembership.exclusions.forEach { disabledService ->
             check(baseModules.contains(disabledService)) {
                 "Service $disabledService was explicitly disabled but no service was generated with that name. Generated:\n ${
-                baseModules.joinToString(
-                    "\n ",
-                )
+                    baseModules.joinToString(
+                        "\n ",
+                    )
                 }"
             }
         }
@@ -173,7 +245,7 @@ fun parseMembership(rawList: String): Membership {
     val inclusions = mutableSetOf<String>()
     val exclusions = mutableSetOf<String>()
 
-    rawList.split(",").map { it.trim() }.forEach { item ->
+    rawList.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { item ->
         when {
             item.startsWith('-') -> exclusions.add(item.substring(1))
             item.startsWith('+') -> inclusions.add(item.substring(1))
@@ -182,7 +254,9 @@ fun parseMembership(rawList: String): Membership {
     }
 
     val conflictingMembers = inclusions.intersect(exclusions)
-    require(conflictingMembers.isEmpty()) { "$conflictingMembers specified both for inclusion and exclusion in $rawList" }
+    require(conflictingMembers.isEmpty()) {
+        "$conflictingMembers specified both for inclusion and exclusion in $rawList"
+    }
 
     return Membership(inclusions, exclusions)
 }

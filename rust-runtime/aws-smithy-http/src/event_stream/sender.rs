@@ -17,12 +17,14 @@ use tracing::trace;
 
 /// Input type for Event Streams.
 pub struct EventStreamSender<T, E> {
-    input_stream: Pin<Box<dyn Stream<Item = Result<T, E>> + Send>>,
+    input_stream: Pin<Box<dyn Stream<Item = Result<T, E>> + Send + Sync>>,
 }
 
 impl<T, E> Debug for EventStreamSender<T, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EventStreamSender(Box<dyn Stream>)")
+        let name_t = std::any::type_name::<T>();
+        let name_e = std::any::type_name::<E>();
+        write!(f, "EventStreamSender<{name_t}, {name_e}>")
     }
 }
 
@@ -40,7 +42,7 @@ impl<T, E: StdError + Send + Sync + 'static> EventStreamSender<T, E> {
 
 impl<T, E, S> From<S> for EventStreamSender<T, E>
 where
-    S: Stream<Item = Result<T, E>> + Send + 'static,
+    S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
 {
     fn from(stream: S) -> Self {
         EventStreamSender {
@@ -49,6 +51,7 @@ where
     }
 }
 
+/// An error that occurs within a message stream.
 #[derive(Debug)]
 pub struct MessageStreamError {
     kind: MessageStreamErrorKind,
@@ -105,6 +108,7 @@ impl fmt::Display for MessageStreamError {
 ///
 /// This will yield an `Err(SdkError::ConstructionFailure)` if a message can't be
 /// marshalled into an Event Stream frame, (e.g., if the message payload was too large).
+#[allow(missing_debug_implementations)]
 pub struct MessageStreamAdapter<T, E: StdError + Send + Sync + 'static> {
     marshaller: Box<dyn MarshallMessage<Input = T> + Send + Sync>,
     error_marshaller: Box<dyn MarshallMessage<Input = E> + Send + Sync>,
@@ -117,6 +121,7 @@ pub struct MessageStreamAdapter<T, E: StdError + Send + Sync + 'static> {
 impl<T, E: StdError + Send + Sync + 'static> Unpin for MessageStreamAdapter<T, E> {}
 
 impl<T, E: StdError + Send + Sync + 'static> MessageStreamAdapter<T, E> {
+    /// Create a new `MessageStreamAdapter`.
     pub fn new(
         marshaller: impl MarshallMessage<Input = T> + Send + Sync + 'static,
         error_marshaller: impl MarshallMessage<Input = E> + Send + Sync + 'static,
@@ -228,9 +233,7 @@ mod tests {
         type Input = TestServiceError;
 
         fn marshall(&self, _input: Self::Input) -> Result<Message, EventStreamError> {
-            Err(Message::read_from(&b""[..])
-                .err()
-                .expect("this should always fail"))
+            Err(Message::read_from(&b""[..]).expect_err("this should always fail"))
         }
     }
 
@@ -257,6 +260,17 @@ mod tests {
                 Message::new(&b""[..]).add_header(Header::new("signed", HeaderValue::Bool(true)))
             ))
         }
+    }
+
+    fn check_send_sync<T: Send + Sync>(value: T) -> T {
+        value
+    }
+
+    #[test]
+    fn event_stream_sender_send_sync() {
+        check_send_sync(EventStreamSender::from(stream! {
+            yield Result::<_, SignMessageError>::Ok(TestMessage("test".into()));
+        }));
     }
 
     fn check_compatible_with_hyper_wrap_stream<S, O, E>(stream: S) -> S

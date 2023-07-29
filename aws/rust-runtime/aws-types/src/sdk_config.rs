@@ -9,29 +9,56 @@
 //!
 //! This module contains an shared configuration representation that is agnostic from a specific service.
 
-use std::sync::Arc;
-
-use aws_smithy_async::rt::sleep::AsyncSleep;
+use aws_credential_types::cache::CredentialsCache;
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_smithy_async::rt::sleep::SharedAsyncSleep;
+use aws_smithy_async::time::{SharedTimeSource, TimeSource};
 use aws_smithy_client::http_connector::HttpConnector;
 use aws_smithy_types::retry::RetryConfig;
 use aws_smithy_types::timeout::TimeoutConfig;
 
 use crate::app_name::AppName;
-use crate::credentials::SharedCredentialsProvider;
-use crate::endpoint::ResolveAwsEndpoint;
+use crate::docs_for;
 use crate::region::Region;
+
+#[doc(hidden)]
+/// Unified docstrings to keep crates in sync. Not intended for public use
+pub mod unified_docs {
+    #[macro_export]
+    macro_rules! docs_for {
+        (use_fips) => {
+"When true, send this request to the FIPS-compliant regional endpoint.
+
+If no FIPS-compliant endpoint can be determined, dispatching the request will return an error."
+        };
+        (use_dual_stack) => {
+"When true, send this request to the dual-stack endpoint.
+
+If no dual-stack endpoint is available the request MAY return an error.
+
+**Note**: Some services do not offer dual-stack as a configurable parameter (e.g. Code Catalyst). For
+these services, this setting has no effect"
+        };
+
+        (time_source) => { "The time source use to use for this client. This only needs to be required for creating deterministic tests or platforms where `SystemTime::now()` is not supported." };
+    }
+}
 
 /// AWS Shared Configuration
 #[derive(Debug, Clone)]
 pub struct SdkConfig {
     app_name: Option<AppName>,
+    credentials_cache: Option<CredentialsCache>,
     credentials_provider: Option<SharedCredentialsProvider>,
     region: Option<Region>,
-    endpoint_resolver: Option<Arc<dyn ResolveAwsEndpoint>>,
+    endpoint_url: Option<String>,
     retry_config: Option<RetryConfig>,
-    sleep_impl: Option<Arc<dyn AsyncSleep>>,
+    sleep_impl: Option<SharedAsyncSleep>,
+    time_source: Option<SharedTimeSource>,
     timeout_config: Option<TimeoutConfig>,
     http_connector: Option<HttpConnector>,
+    use_fips: Option<bool>,
+    use_dual_stack: Option<bool>,
 }
 
 /// Builder for AWS Shared Configuration
@@ -42,13 +69,17 @@ pub struct SdkConfig {
 #[derive(Debug, Default)]
 pub struct Builder {
     app_name: Option<AppName>,
+    credentials_cache: Option<CredentialsCache>,
     credentials_provider: Option<SharedCredentialsProvider>,
     region: Option<Region>,
-    endpoint_resolver: Option<Arc<dyn ResolveAwsEndpoint>>,
+    endpoint_url: Option<String>,
     retry_config: Option<RetryConfig>,
-    sleep_impl: Option<Arc<dyn AsyncSleep>>,
+    sleep_impl: Option<SharedAsyncSleep>,
+    time_source: Option<SharedTimeSource>,
     timeout_config: Option<TimeoutConfig>,
     http_connector: Option<HttpConnector>,
+    use_fips: Option<bool>,
+    use_dual_stack: Option<bool>,
 }
 
 impl Builder {
@@ -86,48 +117,20 @@ impl Builder {
         self
     }
 
-    /// Set the endpoint resolver to use when making requests
-    ///
+    /// Set the endpoint URL to use when making requests.
     /// # Examples
     /// ```
-    /// # fn wrapper() -> Result<(), aws_smithy_http::endpoint::error::InvalidEndpointError> {
-    /// use std::sync::Arc;
     /// use aws_types::SdkConfig;
-    /// use aws_smithy_http::endpoint::Endpoint;
-    /// let config = SdkConfig::builder().endpoint_resolver(
-    ///     Endpoint::immutable("http://localhost:8080")?
-    /// ).build();
-    /// # Ok(())
-    /// # }
+    /// let config = SdkConfig::builder().endpoint_url("http://localhost:8080").build();
     /// ```
-    pub fn endpoint_resolver(
-        mut self,
-        endpoint_resolver: impl ResolveAwsEndpoint + 'static,
-    ) -> Self {
-        self.set_endpoint_resolver(Some(Arc::new(endpoint_resolver)));
+    pub fn endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.set_endpoint_url(Some(endpoint_url.into()));
         self
     }
 
-    /// Set the endpoint resolver to use when making requests
-    ///
-    /// # Examples
-    /// ```
-    /// use std::sync::Arc;
-    /// use aws_types::SdkConfig;
-    /// use aws_types::endpoint::ResolveAwsEndpoint;
-    /// fn endpoint_resolver_override() -> Option<Arc<dyn ResolveAwsEndpoint>> {
-    ///     // ...
-    ///     # None
-    /// }
-    /// let mut config = SdkConfig::builder();
-    /// config.set_endpoint_resolver(endpoint_resolver_override());
-    /// config.build();
-    /// ```
-    pub fn set_endpoint_resolver(
-        &mut self,
-        endpoint_resolver: Option<Arc<dyn ResolveAwsEndpoint>>,
-    ) -> &mut Self {
-        self.endpoint_resolver = endpoint_resolver;
+    /// Set the endpoint URL to use when making requests.
+    pub fn set_endpoint_url(&mut self, endpoint_url: Option<String>) -> &mut Self {
+        self.endpoint_url = endpoint_url;
         self
     }
 
@@ -166,7 +169,6 @@ impl Builder {
     ///
     /// let mut builder = SdkConfig::builder();
     /// disable_retries(&mut builder);
-    /// let config = builder.build();
     /// ```
     pub fn set_retry_config(&mut self, retry_config: Option<RetryConfig>) -> &mut Self {
         self.retry_config = retry_config;
@@ -237,8 +239,7 @@ impl Builder {
     /// # Examples
     ///
     /// ```rust
-    /// use std::sync::Arc;
-    /// use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
+    /// use aws_smithy_async::rt::sleep::{AsyncSleep, SharedAsyncSleep, Sleep};
     /// use aws_types::SdkConfig;
     ///
     /// ##[derive(Debug)]
@@ -250,10 +251,10 @@ impl Builder {
     ///     }
     /// }
     ///
-    /// let sleep_impl = Arc::new(ForeverSleep);
+    /// let sleep_impl = SharedAsyncSleep::new(ForeverSleep);
     /// let config = SdkConfig::builder().sleep_impl(sleep_impl).build();
     /// ```
-    pub fn sleep_impl(mut self, sleep_impl: Arc<dyn AsyncSleep>) -> Self {
+    pub fn sleep_impl(mut self, sleep_impl: SharedAsyncSleep) -> Self {
         self.set_sleep_impl(Some(sleep_impl));
         self
     }
@@ -266,7 +267,7 @@ impl Builder {
     ///
     /// # Examples
     /// ```rust
-    /// # use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
+    /// # use aws_smithy_async::rt::sleep::{AsyncSleep, SharedAsyncSleep, Sleep};
     /// # use aws_types::sdk_config::{Builder, SdkConfig};
     /// #[derive(Debug)]
     /// pub struct ForeverSleep;
@@ -278,7 +279,7 @@ impl Builder {
     /// }
     ///
     /// fn set_never_ending_sleep_impl(builder: &mut Builder) {
-    ///     let sleep_impl = std::sync::Arc::new(ForeverSleep);
+    ///     let sleep_impl = SharedAsyncSleep::new(ForeverSleep);
     ///     builder.set_sleep_impl(Some(sleep_impl));
     /// }
     ///
@@ -286,8 +287,45 @@ impl Builder {
     /// set_never_ending_sleep_impl(&mut builder);
     /// let config = builder.build();
     /// ```
-    pub fn set_sleep_impl(&mut self, sleep_impl: Option<Arc<dyn AsyncSleep>>) -> &mut Self {
+    pub fn set_sleep_impl(&mut self, sleep_impl: Option<SharedAsyncSleep>) -> &mut Self {
         self.sleep_impl = sleep_impl;
+        self
+    }
+
+    /// Set the [`CredentialsCache`] for the builder
+    ///
+    /// # Examples
+    /// ```rust
+    /// use aws_credential_types::cache::CredentialsCache;
+    /// use aws_types::SdkConfig;
+    /// let config = SdkConfig::builder()
+    ///     .credentials_cache(CredentialsCache::lazy())
+    ///     .build();
+    /// ```
+    pub fn credentials_cache(mut self, cache: CredentialsCache) -> Self {
+        self.set_credentials_cache(Some(cache));
+        self
+    }
+
+    /// Set the [`CredentialsCache`] for the builder
+    ///
+    /// # Examples
+    /// ```rust
+    /// use aws_credential_types::cache::CredentialsCache;
+    /// use aws_types::SdkConfig;
+    /// fn override_credentials_cache() -> bool {
+    ///   // ...
+    ///   # true
+    /// }
+    ///
+    /// let mut builder = SdkConfig::builder();
+    /// if override_credentials_cache() {
+    ///     builder.set_credentials_cache(Some(CredentialsCache::lazy()));
+    /// }
+    /// let config = builder.build();
+    /// ```
+    pub fn set_credentials_cache(&mut self, cache: Option<CredentialsCache>) -> &mut Self {
+        self.credentials_cache = cache;
         self
     }
 
@@ -295,11 +333,11 @@ impl Builder {
     ///
     /// # Examples
     /// ```rust
-    /// use aws_types::credentials::{ProvideCredentials, SharedCredentialsProvider};
+    /// use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
     /// use aws_types::SdkConfig;
     /// fn make_provider() -> impl ProvideCredentials {
     ///   // ...
-    ///   # use aws_types::Credentials;
+    ///   # use aws_credential_types::Credentials;
     ///   # Credentials::new("test", "test", None, None, "example")
     /// }
     ///
@@ -316,11 +354,11 @@ impl Builder {
     ///
     /// # Examples
     /// ```rust
-    /// use aws_types::credentials::{ProvideCredentials, SharedCredentialsProvider};
+    /// use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
     /// use aws_types::SdkConfig;
     /// fn make_provider() -> impl ProvideCredentials {
     ///   // ...
-    ///   # use aws_types::Credentials;
+    ///   # use aws_credential_types::Credentials;
     ///   # Credentials::new("test", "test", None, None, "example")
     /// }
     ///
@@ -406,7 +444,7 @@ impl Builder {
     /// use std::time::Duration;
     /// use aws_smithy_client::hyper_ext;
     /// use aws_smithy_client::http_connector::ConnectorSettings;
-    /// use aws_types::sdk_config::{SdkConfig, Builder};
+    /// use aws_types::sdk_config::{Builder, SdkConfig};
     ///
     /// fn override_http_connector(builder: &mut Builder) {
     ///     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
@@ -439,17 +477,57 @@ impl Builder {
         self
     }
 
+    #[doc = docs_for!(use_fips)]
+    pub fn use_fips(mut self, use_fips: bool) -> Self {
+        self.set_use_fips(Some(use_fips));
+        self
+    }
+
+    #[doc = docs_for!(use_fips)]
+    pub fn set_use_fips(&mut self, use_fips: Option<bool>) -> &mut Self {
+        self.use_fips = use_fips;
+        self
+    }
+
+    #[doc = docs_for!(use_dual_stack)]
+    pub fn use_dual_stack(mut self, use_dual_stack: bool) -> Self {
+        self.set_use_dual_stack(Some(use_dual_stack));
+        self
+    }
+
+    #[doc = docs_for!(use_dual_stack)]
+    pub fn set_use_dual_stack(&mut self, use_dual_stack: Option<bool>) -> &mut Self {
+        self.use_dual_stack = use_dual_stack;
+        self
+    }
+
+    #[doc = docs_for!(time_source)]
+    pub fn time_source(mut self, time_source: impl TimeSource + 'static) -> Self {
+        self.set_time_source(Some(SharedTimeSource::new(time_source)));
+        self
+    }
+
+    #[doc = docs_for!(time_source)]
+    pub fn set_time_source(&mut self, time_source: Option<SharedTimeSource>) -> &mut Self {
+        self.time_source = time_source;
+        self
+    }
+
     /// Build a [`SdkConfig`](SdkConfig) from this builder
     pub fn build(self) -> SdkConfig {
         SdkConfig {
             app_name: self.app_name,
+            credentials_cache: self.credentials_cache,
             credentials_provider: self.credentials_provider,
             region: self.region,
-            endpoint_resolver: self.endpoint_resolver,
+            endpoint_url: self.endpoint_url,
             retry_config: self.retry_config,
             sleep_impl: self.sleep_impl,
             timeout_config: self.timeout_config,
             http_connector: self.http_connector,
+            use_fips: self.use_fips,
+            use_dual_stack: self.use_dual_stack,
+            time_source: self.time_source,
         }
     }
 }
@@ -460,9 +538,9 @@ impl SdkConfig {
         self.region.as_ref()
     }
 
-    /// Configured endpoint resolver
-    pub fn endpoint_resolver(&self) -> Option<Arc<dyn ResolveAwsEndpoint>> {
-        self.endpoint_resolver.clone()
+    /// Configured endpoint URL
+    pub fn endpoint_url(&self) -> Option<&str> {
+        self.endpoint_url.as_deref()
     }
 
     /// Configured retry config
@@ -477,13 +555,23 @@ impl SdkConfig {
 
     #[doc(hidden)]
     /// Configured sleep implementation
-    pub fn sleep_impl(&self) -> Option<Arc<dyn AsyncSleep>> {
+    pub fn sleep_impl(&self) -> Option<SharedAsyncSleep> {
         self.sleep_impl.clone()
     }
 
+    /// Configured credentials cache
+    pub fn credentials_cache(&self) -> Option<&CredentialsCache> {
+        self.credentials_cache.as_ref()
+    }
+
     /// Configured credentials provider
-    pub fn credentials_provider(&self) -> Option<&SharedCredentialsProvider> {
-        self.credentials_provider.as_ref()
+    pub fn credentials_provider(&self) -> Option<SharedCredentialsProvider> {
+        self.credentials_provider.clone()
+    }
+
+    /// Configured time source
+    pub fn time_source(&self) -> Option<SharedTimeSource> {
+        self.time_source.clone()
     }
 
     /// Configured app name
@@ -494,6 +582,16 @@ impl SdkConfig {
     /// Configured HTTP Connector
     pub fn http_connector(&self) -> Option<&HttpConnector> {
         self.http_connector.as_ref()
+    }
+
+    /// Use FIPS endpoints
+    pub fn use_fips(&self) -> Option<bool> {
+        self.use_fips
+    }
+
+    /// Use dual-stack endpoint
+    pub fn use_dual_stack(&self) -> Option<bool> {
+        self.use_dual_stack
     }
 
     /// Config builder

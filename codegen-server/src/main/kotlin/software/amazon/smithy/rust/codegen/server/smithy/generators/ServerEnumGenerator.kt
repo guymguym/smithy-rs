@@ -5,28 +5,28 @@
 package software.amazon.smithy.rust.codegen.server.smithy.generators
 
 import software.amazon.smithy.model.shapes.StringShape
-import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
-import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
+import software.amazon.smithy.rust.codegen.core.rustlang.Writable
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustBlock
+import software.amazon.smithy.rust.codegen.core.rustlang.rustBlockTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
-import software.amazon.smithy.rust.codegen.core.smithy.CodegenTarget
+import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType.Companion.preludeScope
 import software.amazon.smithy.rust.codegen.core.smithy.generators.EnumGenerator
+import software.amazon.smithy.rust.codegen.core.smithy.generators.EnumGeneratorContext
+import software.amazon.smithy.rust.codegen.core.smithy.generators.EnumType
 import software.amazon.smithy.rust.codegen.core.smithy.module
 import software.amazon.smithy.rust.codegen.core.util.dq
-import software.amazon.smithy.rust.codegen.core.util.expectTrait
 import software.amazon.smithy.rust.codegen.server.smithy.PubCrateConstraintViolationSymbolProvider
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
 import software.amazon.smithy.rust.codegen.server.smithy.traits.isReachableFromOperationInput
 
-open class ServerEnumGenerator(
-    val codegenContext: ServerCodegenContext,
-    private val writer: RustWriter,
-    shape: StringShape,
-) : EnumGenerator(codegenContext.model, codegenContext.symbolProvider, writer, shape, shape.expectTrait()) {
-    override var target: CodegenTarget = CodegenTarget.SERVER
-
+open class ConstrainedEnum(
+    private val codegenContext: ServerCodegenContext,
+    private val shape: StringShape,
+    private val validationExceptionConversionGenerator: ValidationExceptionConversionGenerator,
+) : EnumType() {
     private val publicConstrainedTypes = codegenContext.settings.codegenConfig.publicConstrainedTypes
     private val constraintViolationSymbolProvider =
         with(codegenContext.constraintViolationSymbolProvider) {
@@ -42,10 +42,8 @@ open class ServerEnumGenerator(
         "String" to RuntimeType.String,
     )
 
-    override fun renderFromForStr() {
-        writer.withInlineModule(
-            constraintViolationSymbol.module() as RustModule.LeafModule,
-        ) {
+    override fun implFromForStr(context: EnumGeneratorContext): Writable = writable {
+        withInlineModule(constraintViolationSymbol.module(), codegenContext.moduleDocProvider) {
             rustTemplate(
                 """
                 ##[derive(Debug, PartialEq)]
@@ -55,61 +53,65 @@ open class ServerEnumGenerator(
             )
 
             if (shape.isReachableFromOperationInput()) {
-                val enumValueSet = enumTrait.enumDefinitionValues.joinToString(", ")
-                val message = "Value {} at '{}' failed to satisfy constraint: Member must satisfy enum value set: [$enumValueSet]"
-
                 rustTemplate(
                     """
                     impl $constraintViolationName {
-                        pub(crate) fn as_validation_exception_field(self, path: #{String}) -> crate::model::ValidationExceptionField {
-                            crate::model::ValidationExceptionField {
-                                message: format!(r##"$message"##, &self.0, &path),
-                                path,
-                            }
-                        }
+                        #{EnumShapeConstraintViolationImplBlock:W}
                     }
                     """,
-                    *codegenScope,
+                    "EnumShapeConstraintViolationImplBlock" to validationExceptionConversionGenerator.enumShapeConstraintViolationImplBlock(
+                        context.enumTrait,
+                    ),
                 )
             }
         }
-        writer.rustBlock("impl #T<&str> for $enumName", RuntimeType.TryFrom) {
+        rustBlock("impl #T<&str> for ${context.enumName}", RuntimeType.TryFrom) {
             rust("type Error = #T;", constraintViolationSymbol)
-            rustBlock("fn try_from(s: &str) -> Result<Self, <Self as #T<&str>>::Error>", RuntimeType.TryFrom) {
+            rustBlockTemplate("fn try_from(s: &str) -> #{Result}<Self, <Self as #{TryFrom}<&str>>::Error>", *preludeScope) {
                 rustBlock("match s") {
-                    sortedMembers.forEach { member ->
-                        rust("${member.value.dq()} => Ok($enumName::${member.derivedName()}),")
+                    context.sortedMembers.forEach { member ->
+                        rust("${member.value.dq()} => Ok(${context.enumName}::${member.derivedName()}),")
                     }
                     rust("_ => Err(#T(s.to_owned()))", constraintViolationSymbol)
                 }
             }
         }
-        writer.rustTemplate(
+        rustTemplate(
             """
-            impl #{TryFrom}<#{String}> for $enumName {
-                type Error = #{UnknownVariantSymbol};
-                fn try_from(s: #{String}) -> std::result::Result<Self, <Self as #{TryFrom}<String>>::Error> {
+            impl #{TryFrom}<#{String}> for ${context.enumName} {
+                type Error = #{ConstraintViolation};
+                fn try_from(s: #{String}) -> #{Result}<Self, <Self as #{TryFrom}<#{String}>>::Error> {
                     s.as_str().try_into()
                 }
             }
             """,
-            "String" to RuntimeType.String,
-            "TryFrom" to RuntimeType.TryFrom,
-            "UnknownVariantSymbol" to constraintViolationSymbol,
+            *preludeScope,
+            "ConstraintViolation" to constraintViolationSymbol,
         )
     }
 
-    override fun renderFromStr() {
-        writer.rustTemplate(
+    override fun implFromStr(context: EnumGeneratorContext): Writable = writable {
+        rustTemplate(
             """
-            impl std::str::FromStr for $enumName {
-                type Err = #{UnknownVariantSymbol};
+            impl std::str::FromStr for ${context.enumName} {
+                type Err = #{ConstraintViolation};
                 fn from_str(s: &str) -> std::result::Result<Self, <Self as std::str::FromStr>::Err> {
                     Self::try_from(s)
                 }
             }
             """,
-            "UnknownVariantSymbol" to constraintViolationSymbol,
+            "ConstraintViolation" to constraintViolationSymbol,
         )
     }
 }
+
+class ServerEnumGenerator(
+    codegenContext: ServerCodegenContext,
+    shape: StringShape,
+    validationExceptionConversionGenerator: ValidationExceptionConversionGenerator,
+) : EnumGenerator(
+    codegenContext.model,
+    codegenContext.symbolProvider,
+    shape,
+    enumType = ConstrainedEnum(codegenContext, shape, validationExceptionConversionGenerator),
+)

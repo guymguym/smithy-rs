@@ -4,11 +4,11 @@
  */
 
 use crate::{bounds, erase, retry, Client};
-use aws_smithy_async::rt::sleep::{default_async_sleep, AsyncSleep};
+use aws_smithy_async::rt::sleep::{default_async_sleep, SharedAsyncSleep};
 use aws_smithy_http::body::SdkBody;
 use aws_smithy_http::result::ConnectorError;
+use aws_smithy_types::retry::ReconnectMode;
 use aws_smithy_types::timeout::{OperationTimeoutConfig, TimeoutConfig};
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct MaybeRequiresSleep<I> {
@@ -36,7 +36,13 @@ pub struct Builder<C = (), M = (), R = retry::Standard> {
     middleware: M,
     retry_policy: MaybeRequiresSleep<R>,
     operation_timeout_config: Option<OperationTimeoutConfig>,
-    sleep_impl: Option<Arc<dyn AsyncSleep>>,
+    sleep_impl: Option<SharedAsyncSleep>,
+    reconnect_mode: Option<ReconnectMode>,
+}
+
+/// transitional default: disable this behavior by default
+const fn default_reconnect_mode() -> ReconnectMode {
+    ReconnectMode::ReuseAllConnections
 }
 
 impl<C, M> Default for Builder<C, M>
@@ -55,6 +61,7 @@ where
             ),
             operation_timeout_config: None,
             sleep_impl: default_async_sleep(),
+            reconnect_mode: Some(default_reconnect_mode()),
         }
     }
 }
@@ -80,21 +87,24 @@ where
     }
 }
 
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 use crate::erase::DynConnector;
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 use crate::http_connector::ConnectorSettings;
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 use crate::hyper_ext::Adapter as HyperAdapter;
+
+#[cfg(all(feature = "native-tls", not(feature = "allow-compilation")))]
+compile_error!("Feature native-tls has been removed. For upgrade instructions, see: https://awslabs.github.io/smithy-rs/design/transport/connector.html");
 
 /// Max idle connections is not standardized across SDKs. Java V1 and V2 use 50, and Go V2 uses 100.
 /// The number below was chosen arbitrarily between those two reference points, and should allow
 /// for 14 separate SDK clients in a Lambda where the max file handles is 1024.
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 const DEFAULT_MAX_IDLE_CONNECTIONS: usize = 70;
 
 /// Returns default HTTP client settings for hyper.
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 fn default_hyper_builder() -> hyper::client::Builder {
     let mut builder = hyper::client::Builder::default();
     builder.pool_max_idle_per_host(DEFAULT_MAX_IDLE_CONNECTIONS);
@@ -117,24 +127,7 @@ impl<M, R> Builder<(), M, R> {
     }
 }
 
-#[cfg(feature = "native-tls")]
-impl<M, R> Builder<(), M, R> {
-    /// Connect to the service over HTTPS using the native TLS library on your
-    /// platform using dynamic dispatch.
-    pub fn native_tls_connector(
-        self,
-        connector_settings: ConnectorSettings,
-    ) -> Builder<DynConnector, M, R> {
-        self.connector(DynConnector::new(
-            HyperAdapter::builder()
-                .hyper_builder(default_hyper_builder())
-                .connector_settings(connector_settings)
-                .build(crate::conns::native_tls()),
-        ))
-    }
-}
-
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(feature = "rustls")]
 impl<M, R> Builder<(), M, R> {
     /// Create a Smithy client builder with an HTTPS connector and the [standard retry
     /// policy](crate::retry::Standard) over the default middleware implementation.
@@ -142,17 +135,13 @@ impl<M, R> Builder<(), M, R> {
     /// For convenience, this constructor type-erases the concrete TLS connector backend used using
     /// dynamic dispatch. This comes at a slight runtime performance cost. See
     /// [`DynConnector`](crate::erase::DynConnector) for details. To avoid that overhead, use
-    /// [`Builder::rustls_connector`] or [`Builder::native_tls_connector`] instead.
+    /// [`Builder::rustls_connector`] instead.
+    #[cfg(feature = "rustls")]
     pub fn dyn_https_connector(
         self,
         connector_settings: ConnectorSettings,
     ) -> Builder<DynConnector, M, R> {
-        #[cfg(feature = "rustls")]
         let with_https = |b: Builder<_, M, R>| b.rustls_connector(connector_settings);
-        // If we are compiling this function & rustls is not enabled, then native-tls MUST be enabled
-        #[cfg(not(feature = "rustls"))]
-        let with_https = |b: Builder<_, M, R>| b.native_tls_connector(connector_settings);
-
         with_https(self)
     }
 }
@@ -173,6 +162,7 @@ impl<M, R> Builder<(), M, R> {
             retry_policy: self.retry_policy,
             operation_timeout_config: self.operation_timeout_config,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode,
         }
     }
 
@@ -229,6 +219,7 @@ impl<C, R> Builder<C, (), R> {
             operation_timeout_config: self.operation_timeout_config,
             middleware,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode,
         }
     }
 
@@ -280,12 +271,14 @@ impl<C, M> Builder<C, M, retry::Standard> {
             operation_timeout_config: self.operation_timeout_config,
             middleware: self.middleware,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode,
         }
     }
 }
 
 impl<C, M> Builder<C, M> {
-    /// Set the standard retry policy's configuration.
+    /// Set the standard retry policy's configuration. When `config` is `None`,
+    /// the default retry policy will be used.
     pub fn set_retry_config(&mut self, config: Option<retry::Config>) -> &mut Self {
         let config = config.unwrap_or_default();
         self.retry_policy =
@@ -299,7 +292,8 @@ impl<C, M> Builder<C, M> {
         self
     }
 
-    /// Set operation timeout config for the client.
+    /// Set operation timeout config for the client. If `operation_timeout_config` is
+    /// `None`, timeouts will be disabled.
     pub fn set_operation_timeout_config(
         &mut self,
         operation_timeout_config: Option<OperationTimeoutConfig>,
@@ -317,14 +311,14 @@ impl<C, M> Builder<C, M> {
         self
     }
 
-    /// Set the [`AsyncSleep`] function that the [`Client`] will use to create things like timeout futures.
-    pub fn set_sleep_impl(&mut self, async_sleep: Option<Arc<dyn AsyncSleep>>) -> &mut Self {
+    /// Set [`aws_smithy_async::rt::sleep::SharedAsyncSleep`] that the [`Client`] will use to create things like timeout futures.
+    pub fn set_sleep_impl(&mut self, async_sleep: Option<SharedAsyncSleep>) -> &mut Self {
         self.sleep_impl = async_sleep;
         self
     }
 
-    /// Set the [`AsyncSleep`] function that the [`Client`] will use to create things like timeout futures.
-    pub fn sleep_impl(mut self, async_sleep: Arc<dyn AsyncSleep>) -> Self {
+    /// Set [`aws_smithy_async::rt::sleep::SharedAsyncSleep`] that the [`Client`] will use to create things like timeout futures.
+    pub fn sleep_impl(mut self, async_sleep: SharedAsyncSleep) -> Self {
         self.set_sleep_impl(Some(async_sleep));
         self
     }
@@ -345,6 +339,7 @@ impl<C, M, R> Builder<C, M, R> {
             retry_policy: self.retry_policy,
             operation_timeout_config: self.operation_timeout_config,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode,
         }
     }
 
@@ -359,7 +354,39 @@ impl<C, M, R> Builder<C, M, R> {
             retry_policy: self.retry_policy,
             operation_timeout_config: self.operation_timeout_config,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode,
         }
+    }
+
+    /// Set the [`ReconnectMode`] for the retry strategy
+    ///
+    /// By default, no reconnection occurs.
+    ///
+    /// When enabled and a transient error is encountered, the connection in use will be poisoned.
+    /// This prevents reusing a connection to a potentially bad host.
+    pub fn reconnect_mode(mut self, reconnect_mode: ReconnectMode) -> Self {
+        self.set_reconnect_mode(Some(reconnect_mode));
+        self
+    }
+
+    /// Set the [`ReconnectMode`] for the retry strategy
+    ///
+    /// By default, no reconnection occurs.
+    ///
+    /// When enabled and a transient error is encountered, the connection in use will be poisoned.
+    /// This prevents reusing a connection to a potentially bad host.
+    pub fn set_reconnect_mode(&mut self, reconnect_mode: Option<ReconnectMode>) -> &mut Self {
+        self.reconnect_mode = reconnect_mode;
+        self
+    }
+
+    /// Enable reconnection on transient errors
+    ///
+    /// By default, when a transient error is encountered, the connection in use will be poisoned.
+    /// This prevents reusing a connection to a potentially bad host but may increase the load on
+    /// the server.
+    pub fn reconnect_on_transient_errors(self) -> Self {
+        self.reconnect_mode(ReconnectMode::ReconnectOnTransientError)
     }
 
     /// Build a Smithy service [`Client`].
@@ -390,6 +417,7 @@ impl<C, M, R> Builder<C, M, R> {
             middleware: self.middleware,
             operation_timeout_config,
             sleep_impl: self.sleep_impl,
+            reconnect_mode: self.reconnect_mode.unwrap_or(default_reconnect_mode()),
         }
     }
 }
@@ -429,7 +457,7 @@ where
 mod tests {
     use super::*;
     use crate::never::NeverConnector;
-    use aws_smithy_async::rt::sleep::Sleep;
+    use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
     use std::panic::{self, AssertUnwindSafe};
     use std::time::Duration;
 
@@ -535,8 +563,5 @@ mod tests {
         #[cfg(feature = "rustls")]
         let _builder: Builder<DynConnector, (), _> =
             Builder::new().rustls_connector(Default::default());
-        #[cfg(feature = "native-tls")]
-        let _builder: Builder<DynConnector, (), _> =
-            Builder::new().native_tls_connector(Default::default());
     }
 }

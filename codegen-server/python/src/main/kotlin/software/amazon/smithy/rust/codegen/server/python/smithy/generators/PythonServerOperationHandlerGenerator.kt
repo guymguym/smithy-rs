@@ -6,15 +6,15 @@
 package software.amazon.smithy.rust.codegen.server.python.smithy.generators
 
 import software.amazon.smithy.model.shapes.OperationShape
+import software.amazon.smithy.rust.codegen.core.rustlang.RustReservedWords
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
+import software.amazon.smithy.rust.codegen.core.util.toPascalCase
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
 import software.amazon.smithy.rust.codegen.server.python.smithy.PythonServerCargoDependency
-import software.amazon.smithy.rust.codegen.server.smithy.generators.ServerOperationHandlerGenerator
-import software.amazon.smithy.rust.codegen.server.smithy.generators.protocol.ServerProtocol
 
 /**
  * The Rust code responsible to run the Python business logic on the Python interpreter
@@ -32,9 +32,8 @@ import software.amazon.smithy.rust.codegen.server.smithy.generators.protocol.Ser
  */
 class PythonServerOperationHandlerGenerator(
     codegenContext: CodegenContext,
-    protocol: ServerProtocol,
-    private val operations: List<OperationShape>,
-) : ServerOperationHandlerGenerator(codegenContext, protocol, operations) {
+    private val operation: OperationShape,
+) {
     private val symbolProvider = codegenContext.symbolProvider
     private val runtimeConfig = codegenContext.runtimeConfig
     private val codegenScope =
@@ -47,42 +46,40 @@ class PythonServerOperationHandlerGenerator(
             "tracing" to PythonServerCargoDependency.Tracing.toType(),
         )
 
-    override fun render(writer: RustWriter) {
-        super.render(writer)
+    fun render(writer: RustWriter) {
         renderPythonOperationHandlerImpl(writer)
     }
 
     private fun renderPythonOperationHandlerImpl(writer: RustWriter) {
-        for (operation in operations) {
-            val operationName = symbolProvider.toSymbol(operation).name
-            val input = "crate::input::${operationName}Input"
-            val output = "crate::output::${operationName}Output"
-            val error = "crate::error::${operationName}Error"
-            val fnName = operationName.toSnakeCase()
+        val operationName = symbolProvider.toSymbol(operation).name
+        val input = "crate::input::${operationName.toPascalCase()}Input"
+        val output = "crate::output::${operationName.toPascalCase()}Output"
+        // TODO(https://github.com/awslabs/smithy-rs/issues/2552) - Use to pascalCase for error shapes.
+        val error = "crate::error::${operationName}Error"
+        val fnName = RustReservedWords.escapeIfNeeded(symbolProvider.toSymbol(operation).name.toSnakeCase())
 
-            writer.rustTemplate(
-                """
-                /// Python handler for operation `$operationName`.
-                pub(crate) async fn $fnName(
-                    input: $input,
-                    state: #{SmithyServer}::Extension<#{SmithyPython}::context::PyContext>,
-                    handler: #{SmithyPython}::PyHandler,
-                ) -> std::result::Result<$output, $error> {
-                    // Async block used to run the handler and catch any Python error.
-                    let result = if handler.is_coroutine {
-                        #{PyCoroutine:W}
-                    } else {
-                        #{PyFunction:W}
-                    };
-                    #{PyError:W}
-                }
-                """,
-                *codegenScope,
-                "PyCoroutine" to renderPyCoroutine(fnName, output),
-                "PyFunction" to renderPyFunction(fnName, output),
-                "PyError" to renderPyError(),
-            )
-        }
+        writer.rustTemplate(
+            """
+            /// Python handler for operation `$operationName`.
+            pub(crate) async fn $fnName(
+                input: $input,
+                state: #{SmithyServer}::Extension<#{SmithyPython}::context::PyContext>,
+                handler: #{SmithyPython}::PyHandler,
+            ) -> std::result::Result<$output, $error> {
+                // Async block used to run the handler and catch any Python error.
+                let result = if handler.is_coroutine {
+                    #{PyCoroutine:W}
+                } else {
+                    #{PyFunction:W}
+                };
+                #{PyError:W}
+            }
+            """,
+            *codegenScope,
+            "PyCoroutine" to renderPyCoroutine(fnName, output),
+            "PyFunction" to renderPyFunction(fnName, output),
+            "PyError" to renderPyError(),
+        )
     }
 
     private fun renderPyFunction(name: String, output: String): Writable =
@@ -118,7 +115,7 @@ class PythonServerOperationHandlerGenerator(
                     };
                     #{pyo3_asyncio}::tokio::into_future(coroutine)
                 })?;
-                result.await.map(|r| #{pyo3}::Python::with_gil(|py| r.extract::<$output>(py)))?
+                result.await.and_then(|r| #{pyo3}::Python::with_gil(|py| r.extract::<$output>(py)))
                 """,
                 *codegenScope,
             )

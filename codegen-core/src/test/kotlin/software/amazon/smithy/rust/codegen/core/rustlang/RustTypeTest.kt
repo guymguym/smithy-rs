@@ -8,6 +8,15 @@ package software.amazon.smithy.rust.codegen.core.rustlang
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import org.junit.jupiter.api.Test
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.all
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.any
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.cfg
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.deny
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.derive
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.doc
+import software.amazon.smithy.rust.codegen.core.rustlang.Attribute.Companion.not
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
+import software.amazon.smithy.rust.codegen.core.util.dq
 
 internal class RustTypesTest {
     private fun forInputExpectOutput(t: Writable, expectedOutput: String) {
@@ -45,14 +54,14 @@ internal class RustTypesTest {
 
     @Test
     fun `RustType_String_writable produces a template-compatible RuntimeType`() {
-        forInputExpectOutput(RustType.String.writable, "'std::string::String'")
+        forInputExpectOutput(RustType.String.writable, "'::std::string::String'")
     }
 
     @Test
     fun `RustType_Vec_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.Vec(RustType.String).writable,
-            "'std::vec::Vec<std::string::String>'",
+            "'::std::vec::Vec<::std::string::String>'",
         )
     }
 
@@ -60,7 +69,7 @@ internal class RustTypesTest {
     fun `RustType_Slice_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.Slice(RustType.String).writable,
-            "'[std::string::String]'",
+            "'[::std::string::String]'",
         )
     }
 
@@ -68,7 +77,7 @@ internal class RustTypesTest {
     fun `RustType_HashMap_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.HashMap(RustType.String, RustType.String).writable,
-            "'std::collections::HashMap<std::string::String, std::string::String>'",
+            "'::std::collections::HashMap<::std::string::String, ::std::string::String>'",
         )
     }
 
@@ -78,7 +87,7 @@ internal class RustTypesTest {
             RustType.HashSet(RustType.String).writable,
             // Rust doesn't guarantee that `HashSet`s are insertion ordered, so we use a `Vec` instead.
             // This is called out in a comment in the RustType.HashSet declaration
-            "'std::vec::Vec<std::string::String>'",
+            "'::std::vec::Vec<::std::string::String>'",
         )
     }
 
@@ -86,15 +95,15 @@ internal class RustTypesTest {
     fun `RustType_Reference_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.Reference("&", RustType.String).writable,
-            "'&std::string::String'",
+            "'&::std::string::String'",
         )
         forInputExpectOutput(
             RustType.Reference("&mut", RustType.String).writable,
-            "'&mut std::string::String'",
+            "'&mut ::std::string::String'",
         )
         forInputExpectOutput(
             RustType.Reference("&'static", RustType.String).writable,
-            "&'static std::string::String'",
+            "&'static ::std::string::String'",
         )
     }
 
@@ -102,7 +111,7 @@ internal class RustTypesTest {
     fun `RustType_Option_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.Option(RustType.String).writable,
-            "'std::option::Option<std::string::String>'",
+            "'::std::option::Option<::std::string::String>'",
         )
     }
 
@@ -110,7 +119,7 @@ internal class RustTypesTest {
     fun `RustType_Box_writable produces a template-compatible RuntimeType`() {
         forInputExpectOutput(
             RustType.Box(RustType.String).writable,
-            "'std::boxed::Box<std::string::String>'",
+            "'::std::boxed::Box<::std::string::String>'",
         )
     }
 
@@ -138,6 +147,77 @@ internal class RustTypesTest {
     fun `types render properly`() {
         val type = RustType.Box(RustType.Option(RustType.Reference("a", RustType.Vec(RustType.String))))
         type.render(false) shouldBe "Box<Option<&'a Vec<String>>>"
-        type.render(true) shouldBe "std::boxed::Box<std::option::Option<&'a std::vec::Vec<std::string::String>>>"
+        type.render(true) shouldBe "::std::boxed::Box<::std::option::Option<&'a ::std::vec::Vec<::std::string::String>>>"
+    }
+
+    @Test
+    fun `attribute macros from strings render properly`() {
+        val attributeMacro = Attribute(
+            Attribute.cfg(
+                Attribute.all(
+                    Attribute.pair("feature" to "unstable".dq()),
+                    Attribute.any(
+                        Attribute.pair("feature" to "serialize".dq()),
+                        Attribute.pair("feature" to "deserialize".dq()),
+                    ),
+                ),
+            ),
+        )
+        forInputExpectOutput(
+            writable {
+                attributeMacro.render(this)
+            },
+            "#[cfg(all(feature = \"unstable\", any(feature = \"serialize\", feature = \"deserialize\")))]\n",
+        )
+    }
+
+    @Test
+    fun `attribute macros render writers properly`() {
+        val attributeMacro = Attribute(
+            cfg(
+                all(
+                    // Normally we'd use the `pair` fn to define these but this is a test
+                    writable { rustInline("""feature = "unstable"""") },
+                    writable { rustInline("""feature = "serialize"""") },
+                    writable { rustInline("""feature = "deserialize"""") },
+                ),
+            ),
+        )
+        forInputExpectOutput(
+            writable {
+                attributeMacro.render(this)
+            },
+            "#[cfg(all(feature = \"unstable\", feature = \"serialize\", feature = \"deserialize\"))]\n",
+        )
+    }
+
+    @Test
+    fun `attribute macros render nothing when empty`() {
+        // All of these attributes require arguments. If none are supplied, then they shouldn't render at all
+        val attributeMacro = Attribute(cfg(all(any(doc(not(deny()))))))
+        forInputExpectOutput(writable { attributeMacro.render(this) }, "")
+    }
+
+    @Test
+    fun `derive attribute macros render properly`() {
+        val attributeMacro = Attribute(
+            derive(
+                RuntimeType.Clone,
+                RuntimeType.Debug,
+                RuntimeType.StdError,
+            ),
+        )
+        forInputExpectOutput(
+            writable {
+                attributeMacro.render(this)
+            },
+            "#[derive(::std::clone::Clone, ::std::error::Error, ::std::fmt::Debug)]\n",
+        )
+    }
+
+    @Test
+    fun `derive attribute macros don't render when empty`() {
+        val attributeMacro = Attribute(derive())
+        forInputExpectOutput(writable { attributeMacro.render(this) }, "")
     }
 }

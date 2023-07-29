@@ -13,6 +13,7 @@ use aws_smithy_types::retry::{ErrorKind, ProvideErrorKind, RetryKind};
 
 /// Classifies what kind of retry is needed for a given `response`.
 pub trait ClassifyRetry<T, E>: Clone {
+    /// Run this classifier against a response to determine if it should be retried.
     fn classify_retry(&self, response: Result<&T, &E>) -> RetryKind;
 }
 
@@ -44,7 +45,7 @@ impl DefaultResponseRetryClassifier {
             Err(SdkError::DispatchFailure(err)) => {
                 if err.is_timeout() || err.is_io() {
                     Err(RetryKind::Error(ErrorKind::TransientError))
-                } else if let Some(ek) = err.is_other() {
+                } else if let Some(ek) = err.as_other() {
                     Err(RetryKind::Error(ek))
                 } else {
                     Err(RetryKind::UnretryableFailure)

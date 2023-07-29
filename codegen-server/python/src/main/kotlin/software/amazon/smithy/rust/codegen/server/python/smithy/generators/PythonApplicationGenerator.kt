@@ -5,16 +5,15 @@
 
 package software.amazon.smithy.rust.codegen.server.python.smithy.generators
 
+import software.amazon.smithy.model.knowledge.TopDownIndex
 import software.amazon.smithy.model.shapes.OperationShape
 import software.amazon.smithy.model.traits.DocumentationTrait
+import software.amazon.smithy.rust.codegen.core.rustlang.RustReservedWords
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustBlockTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
-import software.amazon.smithy.rust.codegen.core.smithy.ErrorsModule
-import software.amazon.smithy.rust.codegen.core.smithy.InputsModule
-import software.amazon.smithy.rust.codegen.core.smithy.OutputsModule
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.util.getTrait
 import software.amazon.smithy.rust.codegen.core.util.inputShape
@@ -22,8 +21,13 @@ import software.amazon.smithy.rust.codegen.core.util.outputShape
 import software.amazon.smithy.rust.codegen.core.util.toPascalCase
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
 import software.amazon.smithy.rust.codegen.server.python.smithy.PythonServerCargoDependency
+import software.amazon.smithy.rust.codegen.server.python.smithy.PythonType
+import software.amazon.smithy.rust.codegen.server.python.smithy.renderAsDocstring
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.generators.protocol.ServerProtocol
+import software.amazon.smithy.rust.codegen.server.smithy.ServerRustModule.Error as ErrorModule
+import software.amazon.smithy.rust.codegen.server.smithy.ServerRustModule.Input as InputModule
+import software.amazon.smithy.rust.codegen.server.smithy.ServerRustModule.Output as OutputModule
 
 /**
  * Generates a Python compatible application and server that can be configured from Python.
@@ -64,10 +68,15 @@ import software.amazon.smithy.rust.codegen.server.smithy.generators.protocol.Ser
 class PythonApplicationGenerator(
     codegenContext: CodegenContext,
     private val protocol: ServerProtocol,
-    private val operations: List<OperationShape>,
 ) {
+    private val index = TopDownIndex.of(codegenContext.model)
+    private val operations = index.getContainedOperations(codegenContext.serviceShape).toSortedSet(
+        compareBy {
+            it.id
+        },
+    ).toList()
     private val symbolProvider = codegenContext.symbolProvider
-    private val libName = "lib${codegenContext.settings.moduleName.toSnakeCase()}"
+    private val libName = codegenContext.settings.moduleName.toSnakeCase()
     private val runtimeConfig = codegenContext.runtimeConfig
     private val service = codegenContext.serviceShape
     private val serviceName = service.id.name.toPascalCase()
@@ -103,6 +112,9 @@ class PythonApplicationGenerator(
             """
             ##[#{pyo3}::pyclass]
             ##[derive(Debug)]
+            /// :generic Ctx:
+            /// :extends typing.Generic\[Ctx\]:
+            /// :rtype None:
             pub struct App {
                 handlers: #{HashMap}<String, #{SmithyPython}::PyHandler>,
                 middlewares: Vec<#{SmithyPython}::PyMiddlewareHandler>,
@@ -192,14 +204,13 @@ class PythonApplicationGenerator(
                     *codegenScope,
                 )
                 for (operation in operations) {
-                    val operationName = symbolProvider.toSymbol(operation).name
-                    val name = operationName.toSnakeCase()
+                    val fnName = RustReservedWords.escapeIfNeeded(symbolProvider.toSymbol(operation).name.toSnakeCase())
                     rustTemplate(
                         """
-                        let ${name}_locals = #{pyo3_asyncio}::TaskLocals::new(event_loop);
-                        let handler = self.handlers.get("$name").expect("Python handler for operation `$name` not found").clone();
-                        let builder = builder.$name(move |input, state| {
-                            #{pyo3_asyncio}::tokio::scope(${name}_locals.clone(), crate::operation_handler::$name(input, state, handler.clone()))
+                        let ${fnName}_locals = #{pyo3_asyncio}::TaskLocals::new(event_loop);
+                        let handler = self.handlers.get("$fnName").expect("Python handler for operation `$fnName` not found").clone();
+                        let builder = builder.$fnName(move |input, state| {
+                            #{pyo3_asyncio}::tokio::scope(${fnName}_locals.clone(), crate::python_operation_adaptor::$fnName(input, state, handler.clone()))
                         });
                         """,
                         *codegenScope,
@@ -239,6 +250,12 @@ class PythonApplicationGenerator(
             """,
             *codegenScope,
         ) {
+            val middlewareRequest = PythonType.Opaque("Request", libName, rustNamespace = "crate::middleware")
+            val middlewareResponse = PythonType.Opaque("Response", libName, rustNamespace = "crate::middleware")
+            val middlewareNext = PythonType.Callable(listOf(middlewareRequest), PythonType.Awaitable(middlewareResponse))
+            val middlewareFunc = PythonType.Callable(listOf(middlewareRequest, middlewareNext), PythonType.Awaitable(middlewareResponse))
+            val tlsConfig = PythonType.Opaque("TlsConfig", libName, rustNamespace = "crate::tls")
+
             rustTemplate(
                 """
                 /// Create a new [App].
@@ -246,12 +263,20 @@ class PythonApplicationGenerator(
                 pub fn new() -> Self {
                     Self::default()
                 }
+
                 /// Register a context object that will be shared between handlers.
+                ///
+                /// :param context Ctx:
+                /// :rtype ${PythonType.None.renderAsDocstring()}:
                 ##[pyo3(text_signature = "(${'$'}self, context)")]
                 pub fn context(&mut self, context: #{pyo3}::PyObject) {
                    self.context = Some(context);
                 }
+
                 /// Register a Python function to be executed inside a Tower middleware layer.
+                ///
+                /// :param func ${middlewareFunc.renderAsDocstring()}:
+                /// :rtype ${PythonType.None.renderAsDocstring()}:
                 ##[pyo3(text_signature = "(${'$'}self, func)")]
                 pub fn middleware(&mut self, py: #{pyo3}::Python, func: #{pyo3}::PyObject) -> #{pyo3}::PyResult<()> {
                     let handler = #{SmithyPython}::PyMiddlewareHandler::new(py, func)?;
@@ -263,8 +288,16 @@ class PythonApplicationGenerator(
                     self.middlewares.push(handler);
                     Ok(())
                 }
+
                 /// Main entrypoint: start the server on multiple workers.
-                ##[pyo3(text_signature = "(${'$'}self, address, port, backlog, workers, tls)")]
+                ///
+                /// :param address ${PythonType.Optional(PythonType.Str).renderAsDocstring()}:
+                /// :param port ${PythonType.Optional(PythonType.Int).renderAsDocstring()}:
+                /// :param backlog ${PythonType.Optional(PythonType.Int).renderAsDocstring()}:
+                /// :param workers ${PythonType.Optional(PythonType.Int).renderAsDocstring()}:
+                /// :param tls ${PythonType.Optional(tlsConfig).renderAsDocstring()}:
+                /// :rtype ${PythonType.None.renderAsDocstring()}:
+                ##[pyo3(text_signature = "(${'$'}self, address=None, port=None, backlog=None, workers=None, tls=None)")]
                 pub fn run(
                     &mut self,
                     py: #{pyo3}::Python,
@@ -277,8 +310,10 @@ class PythonApplicationGenerator(
                     use #{SmithyPython}::PyApp;
                     self.run_server(py, address, port, backlog, workers, tls)
                 }
+
                 /// Lambda entrypoint: start the server on Lambda.
-                ##[cfg(feature = "aws-lambda")]
+                ///
+                /// :rtype ${PythonType.None.renderAsDocstring()}:
                 ##[pyo3(text_signature = "(${'$'}self)")]
                 pub fn run_lambda(
                     &mut self,
@@ -287,8 +322,9 @@ class PythonApplicationGenerator(
                     use #{SmithyPython}::PyApp;
                     self.run_lambda_handler(py)
                 }
+
                 /// Build the service and start a single worker.
-                ##[pyo3(text_signature = "(${'$'}self, socket, worker_number, tls)")]
+                ##[pyo3(text_signature = "(${'$'}self, socket, worker_number, tls=None)")]
                 pub fn start_worker(
                     &mut self,
                     py: pyo3::Python,
@@ -306,15 +342,36 @@ class PythonApplicationGenerator(
             )
             operations.map { operation ->
                 val operationName = symbolProvider.toSymbol(operation).name
-                val name = operationName.toSnakeCase()
+                val fnName = RustReservedWords.escapeIfNeeded(symbolProvider.toSymbol(operation).name.toSnakeCase())
+
+                val input = PythonType.Opaque("${operationName}Input", libName, rustNamespace = "crate::input")
+                val output = PythonType.Opaque("${operationName}Output", libName, rustNamespace = "crate::output")
+                val context = PythonType.Opaque("Ctx", libName)
+                val returnType = PythonType.Union(listOf(output, PythonType.Awaitable(output)))
+                val handler = PythonType.Union(
+                    listOf(
+                        PythonType.Callable(
+                            listOf(input, context),
+                            returnType,
+                        ),
+                        PythonType.Callable(
+                            listOf(input),
+                            returnType,
+                        ),
+                    ),
+                )
+
                 rustTemplate(
                     """
-                    /// Method to register `$name` Python implementation inside the handlers map.
+                    /// Method to register `$fnName` Python implementation inside the handlers map.
                     /// It can be used as a function decorator in Python.
+                    ///
+                    /// :param func ${handler.renderAsDocstring()}:
+                    /// :rtype ${PythonType.None.renderAsDocstring()}:
                     ##[pyo3(text_signature = "(${'$'}self, func)")]
-                    pub fn $name(&mut self, py: #{pyo3}::Python, func: #{pyo3}::PyObject) -> #{pyo3}::PyResult<()> {
+                    pub fn $fnName(&mut self, py: #{pyo3}::Python, func: #{pyo3}::PyObject) -> #{pyo3}::PyResult<()> {
                         use #{SmithyPython}::PyApp;
-                        self.register_operation(py, "$name", func)
+                        self.register_operation(py, "$fnName", func)
                     }
                     """,
                     *codegenScope,
@@ -339,12 +396,12 @@ class PythonApplicationGenerator(
         )
         writer.rust(
             """
-            /// from $libName import ${InputsModule.name}
-            /// from $libName import ${OutputsModule.name}
+            /// from $libName import ${InputModule.name}
+            /// from $libName import ${OutputModule.name}
             """.trimIndent(),
         )
         if (operations.any { it.errors.isNotEmpty() }) {
-            writer.rust("""/// from $libName import ${ErrorsModule.name}""".trimIndent())
+            writer.rust("""/// from $libName import ${ErrorModule.name}""".trimIndent())
         }
         writer.rust(
             """
@@ -383,7 +440,9 @@ class PythonApplicationGenerator(
             val operationDocumentation = it.getTrait<DocumentationTrait>()?.value
             val ret = if (!operationDocumentation.isNullOrBlank()) {
                 operationDocumentation.replace("#", "##").prependIndent("/// ## ") + "\n"
-            } else ""
+            } else {
+                ""
+            }
             ret +
                 """
                 /// ${it.signature()}:
@@ -398,8 +457,8 @@ class PythonApplicationGenerator(
     private fun OperationShape.signature(): String {
         val inputSymbol = symbolProvider.toSymbol(inputShape(model))
         val outputSymbol = symbolProvider.toSymbol(outputShape(model))
-        val inputT = "${InputsModule.name}::${inputSymbol.name}"
-        val outputT = "${OutputsModule.name}::${outputSymbol.name}"
+        val inputT = "${InputModule.name}::${inputSymbol.name}"
+        val outputT = "${OutputModule.name}::${outputSymbol.name}"
         val operationName = symbolProvider.toSymbol(this).name.toSnakeCase()
         return "@app.$operationName\n/// def $operationName(input: $inputT, ctx: Context) -> $outputT"
     }

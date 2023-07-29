@@ -18,12 +18,12 @@ import java.util.Optional
 /**
  * [ClientRustSettings] and [ClientCodegenConfig] classes.
  *
- * These are specializations of [RustSettings] and [CodegenConfig] for the `rust-codegen` client Smithy plugin. Refer
- * to the documentation of those for the inherited properties.
+ * These are specializations of [CoreRustSettings] and [CodegenConfig] for the `rust-client-codegen`
+ * client Smithy plugin. Refer to the documentation of those for the inherited properties.
  */
 
 /**
- * Settings used by [RustCodegenPlugin].
+ * Settings used by [RustClientCodegenPlugin].
  */
 data class ClientRustSettings(
     override val service: ShapeId,
@@ -72,6 +72,23 @@ data class ClientRustSettings(
     }
 }
 
+// TODO(enableNewSmithyRuntimeCleanup): Remove this mode after switching to the orchestrator
+enum class SmithyRuntimeMode {
+    Middleware, Orchestrator,
+    ;
+
+    val generateMiddleware: Boolean get() = this == Middleware
+    val generateOrchestrator: Boolean get() = this == Orchestrator
+
+    companion object {
+        fun fromString(value: String): SmithyRuntimeMode = when (value) {
+            "middleware" -> Middleware
+            "orchestrator" -> Orchestrator
+            else -> throw IllegalArgumentException("unknown runtime mode: $value")
+        }
+    }
+}
+
 /**
  * [renameExceptions]: Rename `Exception` to `Error` in the generated SDK
  * [includeFluentClient]: Generate a `client` module in the generated SDK (currently the AWS SDK sets this to `false`
@@ -86,6 +103,11 @@ data class ClientCodegenConfig(
     val addMessageToErrors: Boolean = defaultAddMessageToErrors,
     // TODO(EventStream): [CLEANUP] Remove this property when turning on Event Stream for all services
     val eventStreamAllowList: Set<String> = defaultEventStreamAllowList,
+    // TODO(enableNewSmithyRuntimeCleanup): Remove this once we commit to switch to aws-smithy-runtime and aws-smithy-runtime-api
+    val enableNewSmithyRuntime: SmithyRuntimeMode = defaultEnableNewSmithyRuntime,
+    /** If true, adds `endpoint_url`/`set_endpoint_url` methods to the service config */
+    val includeEndpointUrlConfig: Boolean = defaultIncludeEndpointUrlConfig,
+    val enableUserConfigurableRuntimePlugins: Boolean = defaultEnableUserConfigurableRuntimePlugins,
 ) : CoreCodegenConfig(
     formatTimeoutSeconds, debugMode,
 ) {
@@ -94,24 +116,31 @@ data class ClientCodegenConfig(
         private const val defaultIncludeFluentClient = true
         private const val defaultAddMessageToErrors = true
         private val defaultEventStreamAllowList: Set<String> = emptySet()
+        private val defaultEnableNewSmithyRuntime = SmithyRuntimeMode.Orchestrator
+        private const val defaultIncludeEndpointUrlConfig = true
+        private const val defaultEnableUserConfigurableRuntimePlugins = true
 
         fun fromCodegenConfigAndNode(coreCodegenConfig: CoreCodegenConfig, node: Optional<ObjectNode>) =
             if (node.isPresent) {
                 ClientCodegenConfig(
                     formatTimeoutSeconds = coreCodegenConfig.formatTimeoutSeconds,
                     debugMode = coreCodegenConfig.debugMode,
-                    eventStreamAllowList = node.get().getArrayMember("eventStreamAllowList")
-                        .map { array -> array.toList().mapNotNull { node -> node.asStringNode().orNull()?.value } }
-                        .orNull()?.toSet() ?: defaultEventStreamAllowList,
+                    eventStreamAllowList = node.get().getArrayMember("eventStreamAllowList").map { array ->
+                        array.toList().mapNotNull { node ->
+                            node.asStringNode().orNull()?.value
+                        }
+                    }.orNull()?.toSet() ?: defaultEventStreamAllowList,
                     renameExceptions = node.get().getBooleanMemberOrDefault("renameErrors", defaultRenameExceptions),
                     includeFluentClient = node.get().getBooleanMemberOrDefault("includeFluentClient", defaultIncludeFluentClient),
                     addMessageToErrors = node.get().getBooleanMemberOrDefault("addMessageToErrors", defaultAddMessageToErrors),
+                    enableNewSmithyRuntime = SmithyRuntimeMode.fromString(node.get().getStringMemberOrDefault("enableNewSmithyRuntime", "middleware")),
+                    includeEndpointUrlConfig = node.get().getBooleanMemberOrDefault("includeEndpointUrlConfig", defaultIncludeEndpointUrlConfig),
+                    enableUserConfigurableRuntimePlugins = node.get().getBooleanMemberOrDefault("enableUserConfigurableRuntimePlugins", defaultEnableUserConfigurableRuntimePlugins),
                 )
             } else {
                 ClientCodegenConfig(
                     formatTimeoutSeconds = coreCodegenConfig.formatTimeoutSeconds,
                     debugMode = coreCodegenConfig.debugMode,
-                    eventStreamAllowList = defaultEventStreamAllowList,
                 )
             }
     }

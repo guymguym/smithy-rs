@@ -165,10 +165,9 @@ impl RequestSpec {
     /// So this ranking of routes implements some basic pattern conflict disambiguation with some
     /// common sense. It's also the same behavior that [the TypeScript sSDK is implementing].
     ///
-    /// TODO(https://github.com/awslabs/smithy/issues/1029#issuecomment-1002683552): Once Smithy
-    /// updates the spec to define the behavior, update our implementation.
-    ///
     /// [the TypeScript sSDK is implementing]: https://github.com/awslabs/smithy-typescript/blob/d263078b81485a6a2013d243639c0c680343ff47/smithy-typescript-ssdk-libs/server-common/src/httpbinding/mux.ts#L59.
+    // TODO(https://github.com/awslabs/smithy/issues/1029#issuecomment-1002683552): Once Smithy
+    // updates the spec to define the behavior, update our implementation.
     pub(crate) fn rank(&self) -> usize {
         // self.uri_spec.path_and_query.path_segments.0.len() + self.uri_spec.path_and_query.query_segments.0.len()
         // S3D ROUTING HACK - more weight to routes with more labels so that S3 `bucket` paths will not shadow `bucket/key` paths
@@ -197,13 +196,18 @@ impl RequestSpec {
 
         match req.uri().query() {
             Some(query) => {
-                // We can't use `HashMap<&str, &str>` because a query string key can appear more
+                // We can't use `HashMap<Cow<str>, Cow<str>>` because a query string key can appear more
                 // than once e.g. `/?foo=bar&foo=baz`. We _could_ use a multiset e.g. the `hashbag`
                 // crate.
-                let res = serde_urlencoded::from_str::<Vec<(&str, &str)>>(query);
+                // We must deserialize into `Cow<str>`s because `serde_urlencoded` might need to
+                // return an owned allocated `String` if it has to percent-decode a slice of the query string.
+                let res = serde_urlencoded::from_str::<Vec<(Cow<str>, Cow<str>)>>(query);
 
                 match res {
-                    Err(_) => Match::No,
+                    Err(error) => {
+                        tracing::debug!(query, %error, "failed to deserialize query string");
+                        Match::No
+                    }
                     Ok(query_map) => {
                         for query_segment in self.uri_spec.path_and_query.query_segments.0.iter() {
                             match query_segment {
@@ -261,8 +265,9 @@ impl RequestSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::super::rest_tests::req;
     use super::*;
+    use crate::protocol::test_helpers::req;
+
     use http::Method;
 
     #[test]
@@ -380,6 +385,17 @@ mod tests {
         assert_eq!(
             Match::No,
             key_value_spec().matches(&req(&Method::DELETE, "/?foo=bar&foo=baz", None))
+        );
+    }
+
+    #[test]
+    fn encoded_query_string() {
+        let request_spec =
+            RequestSpec::from_parts(Method::DELETE, Vec::new(), vec![QuerySegment::Key("foo".to_owned())]);
+
+        assert_eq!(
+            Match::Yes,
+            request_spec.matches(&req(&Method::DELETE, "/?foo=hello%20world", None))
         );
     }
 

@@ -3,19 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_http::user_agent::AwsUserAgent;
 use aws_sdk_qldbsession as qldbsession;
 use aws_smithy_client::test_connection::TestConnection;
-use aws_smithy_client::Client as CoreClient;
 use aws_smithy_http::body::SdkBody;
 use http::Uri;
-use qldbsession::middleware::DefaultMiddleware;
-use qldbsession::model::StartSessionRequest;
-use qldbsession::operation::SendCommand;
-use qldbsession::Credentials;
-use qldbsession::{Config, Region};
+use qldbsession::config::{Config, Credentials, Region};
+use qldbsession::types::StartSessionRequest;
+use qldbsession::Client;
 use std::time::{Duration, UNIX_EPOCH};
-pub type Client<C> = CoreClient<C, DefaultMiddleware>;
 
 // TODO(DVR): having the full HTTP requests right in the code is a bit gross, consider something
 // like https://github.com/davidbarsky/sigv4/blob/master/aws-sigv4/src/lib.rs#L283-L315 to store
@@ -23,13 +18,6 @@ pub type Client<C> = CoreClient<C, DefaultMiddleware>;
 
 #[tokio::test]
 async fn signv4_use_correct_service_name() {
-    let creds = Credentials::new(
-        "ANOTREAL",
-        "notrealrnrELgWzOk3IfjzDKtFBhDby",
-        Some("notarealsessiontoken".to_string()),
-        None,
-        "test",
-    );
     let conn = TestConnection::new(vec![(
         http::Request::builder()
             .header("content-type", "application/x-amz-json-1.0")
@@ -46,30 +34,33 @@ async fn signv4_use_correct_service_name() {
             .status(http::StatusCode::from_u16(200).unwrap())
             .body(r#"{}"#).unwrap()),
     ]);
-
-    let client = Client::new(conn.clone());
     let conf = Config::builder()
+        .http_connector(conn.clone())
         .region(Region::new("us-east-1"))
-        .credentials_provider(creds)
+        .credentials_provider(Credentials::for_tests())
         .build();
+    let client = Client::from_conf(conf);
 
-    let mut op = SendCommand::builder()
+    let _ = client
+        .send_command()
         .start_session(
             StartSessionRequest::builder()
                 .ledger_name("not-real-ledger")
                 .build(),
         )
-        .build()
-        .unwrap()
-        .make_operation(&conf)
+        .customize()
         .await
-        .expect("valid operation");
-    // Fix the request time and user agent so the headers are stable
-    op.properties_mut()
-        .insert(UNIX_EPOCH + Duration::from_secs(1614952162));
-    op.properties_mut().insert(AwsUserAgent::for_tests());
-
-    let _ = client.call(op).await.expect("request should succeed");
+        .expect("should be customizable")
+        // Fix the request time and user agent so the headers are stable
+        .request_time_for_tests(UNIX_EPOCH + Duration::from_secs(1614952162))
+        .user_agent_for_tests()
+        .mutate_request(|req| {
+            // Remove the invocation ID since the signed request above doesn't have it
+            req.headers_mut().remove("amz-sdk-invocation-id");
+        })
+        .send()
+        .await
+        .expect("request should succeed");
 
     conn.assert_requests_match(&[]);
 }

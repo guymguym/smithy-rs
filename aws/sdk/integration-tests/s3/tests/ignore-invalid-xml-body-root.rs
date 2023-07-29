@@ -3,15 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_http::user_agent::AwsUserAgent;
-use aws_sdk_s3::{model::ObjectAttributes, Client, Credentials, Region};
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3::{config::Credentials, config::Region, types::ObjectAttributes, Client};
 use aws_smithy_client::test_connection::TestConnection;
 use aws_smithy_http::body::SdkBody;
-use aws_types::{credentials::SharedCredentialsProvider, SdkConfig};
-use std::{
-    convert::Infallible,
-    time::{Duration, UNIX_EPOCH},
-};
+use aws_types::SdkConfig;
+use http::header::AUTHORIZATION;
+use std::time::{Duration, UNIX_EPOCH};
 
 const RESPONSE_BODY_XML: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Checksum><ChecksumSHA1>e1AsOh9IyGCa4hLN+2Od7jlnP14=</ChecksumSHA1></Checksum></GetObjectAttributesResponse>";
 
@@ -25,7 +23,7 @@ async fn ignore_invalid_xml_body_root() {
              .header("authorization", "AWS4-HMAC-SHA256 Credential=ANOTREAL/20210618/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-object-attributes;x-amz-security-token;x-amz-user-agent, Signature=0e6ec749db5a0af07890a83f553319eda95be0e498d058c64880471a474c5378")
              .header("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
              .header("x-amz-security-token", "notarealsessiontoken")
-             .uri(http::Uri::from_static("https://s3.us-east-1.amazonaws.com/some-test-bucket/test.txt?attributes"))
+             .uri(http::Uri::from_static("https://some-test-bucket.s3.us-east-1.amazonaws.com/test.txt?attributes"))
              .body(SdkBody::empty())
              .unwrap(),
          http::Response::builder()
@@ -44,13 +42,7 @@ async fn ignore_invalid_xml_body_root() {
     ]);
 
     let sdk_config = SdkConfig::builder()
-        .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-            "ANOTREAL",
-            "notrealrnrELgWzOk3IfjzDKtFBhDby",
-            Some("notarealsessiontoken".to_string()),
-            None,
-            "test",
-        )))
+        .credentials_provider(SharedCredentialsProvider::new(Credentials::for_tests()))
         .region(Region::new("us-east-1"))
         .http_connector(conn.clone())
         .build();
@@ -64,17 +56,11 @@ async fn ignore_invalid_xml_body_root() {
         .customize()
         .await
         .unwrap()
-        .map_operation(|mut op| {
-            op.properties_mut()
-                .insert(UNIX_EPOCH + Duration::from_secs(1624036048));
-            op.properties_mut().insert(AwsUserAgent::for_tests());
-
-            Result::Ok::<_, Infallible>(op)
-        })
-        .unwrap()
+        .request_time_for_tests(UNIX_EPOCH + Duration::from_secs(1624036048))
+        .user_agent_for_tests()
         .send()
         .await
         .unwrap();
 
-    conn.assert_requests_match(&[]);
+    conn.assert_requests_match(&[AUTHORIZATION]);
 }
